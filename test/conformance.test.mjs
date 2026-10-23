@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { Client, SurfraError, SurfraFailure, Volume } from "../dist/node.js";
+import { App, Client, SurfraError, SurfraFailure, Volume, Workflow } from "../dist/node.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUITE = process.env.SURFRA_SDK_TESTS ?? path.join(HERE, "..", "..", "surfra-sdk-tests");
@@ -210,4 +210,61 @@ test("j01_job_with_volumes_finishes", { skip }, async (t) => {
   const view = await job.wait({ intervalMs: 50, timeoutMs: 30000 });
   assert.equal(view.status, "succeeded");
   assert.equal(view.exit_code, 0);
+});
+
+test("v15_write_and_read_helpers", { skip }, async (t) => {
+  const fake = await start(t);
+  const weights = await fake.volume("weights");
+  await weights.write("bytes.bin", new Uint8Array([0, 1, 114, 97, 119]));
+  assert.deepEqual([...(await weights.read("bytes.bin"))], [0, 1, 114, 97, 119]);
+});
+
+test("c01_control_plane_calls_skip_the_volumes_token", { skip }, async (t) => {
+  const fake = await start(t);
+  const dir = await temp("c01");
+  await fs.writeFile(path.join(dir, "token"), "aaa.bbb.ccc");
+  const settings = { ...fake.settings, tokenFile: path.join(dir, "token") };
+  const weights = new Volume("weights", settings);
+  await weights.create();
+  await weights.ls();
+  await new Client(settings).run("embed", {}, { timeoutMs: 30000 });
+  const sent = Object.fromEntries((await fake.requests()).map((item) => [item.path, item.auth]));
+  assert.equal(sent["/v1/volumes"], "Bearer sfk_test");
+  assert.equal(sent["/v1/transactions"], "Bearer sfk_test");
+  assert.equal(sent["/v1/weights/list"], "Bearer aaa.bbb.ccc");
+});
+
+test("a03_app_deploy_sends_the_spec", { skip }, async (t) => {
+  const fake = await start(t);
+  const saved = await new App("embed", fake.settings).deploy({ image: "ghcr.io/acme/embed:1", entrypoint: "app.py", autoscale: { max_replicas: 2 }, runtime: { engine: "python" } });
+  assert.equal(saved.name, "embed");
+  assert.ok(saved.id.startsWith("sfa_"));
+  assert.equal(saved.image, "ghcr.io/acme/embed:1");
+  assert.deepEqual(saved.autoscale, { max_replicas: 2 });
+  assert.ok((await fake.requests()).some((item) => item.method === "PUT" && item.path === "/v1/apps/embed"));
+});
+
+test("a04_app_run_and_volumes", { skip }, async (t) => {
+  const fake = await start(t);
+  const app = new App("embed", fake.settings);
+  assert.deepEqual(await app.run({ x: 1 }, { timeoutMs: 30000 }), { app: "embed", echo: { x: 1 } });
+  await app.setVolumes(["weights:r"]);
+  assert.deepEqual(await app.volumes(), [{ volume: "weights", mode: "r" }]);
+});
+
+test("a05_a_rate_limited_submit_waits_and_succeeds", { skip }, async (t) => {
+  const fake = await start(t);
+  assert.deepEqual(await new Client(fake.settings).run("busy", { n: 1 }, { timeoutMs: 30000 }), { app: "busy", echo: { n: 1 } });
+  assert.equal((await fake.requests()).filter((item) => item.path === "/v1/transactions").length, 2);
+});
+
+test("w01_workflow_run_returns_each_stage", { skip }, async (t) => {
+  const fake = await start(t);
+  assert.deepEqual(await new Workflow("pipeline", fake.settings).run({ q: "hi" }, { timeoutMs: 30000 }), { a: { app: "embed", echo: { q: "hi" } }, b: { app: "rerank", echo: {} } });
+});
+
+test("j02_job_logs_oldest_first", { skip }, async (t) => {
+  const fake = await start(t);
+  const job = await new Client(fake.settings).submitJob({ entrypoint: "echo hi", image: "img", providers: [{ provider: "local" }] });
+  assert.deepEqual((await job.logs()).map((line) => line.m), ["line 0", "line 1", "line 2"]);
 });

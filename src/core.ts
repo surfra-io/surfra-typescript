@@ -38,8 +38,10 @@ export interface Settings {
   envApiKey?: string;
   /** `SURFRA_REPLICA_TOKEN`. */
   replicaToken?: string;
-  /** Extra credential sources, tried after `apiKey`: the Node build reads the token file and the saved login. */
-  credentialSources?: Array<() => string | undefined>;
+  /** Reads the volumes token Surfra gives apps and jobs. Set by the Node build from `SURFRA_VOLUMES_TOKEN_FILE`. */
+  readTokenFile?: () => string | undefined;
+  /** Reads the session `surfra login` saved. Set by the Node build. */
+  readLogin?: () => string | undefined;
 }
 
 type Env = Record<string, string | undefined>;
@@ -67,16 +69,15 @@ export function settingsFromEnv(env: Env = processEnv()): Settings {
 
 /** The credential to send, in Surfra's order: explicit key, token file, SURFRA_API_KEY, SURFRA_REPLICA_TOKEN, saved login. */
 export function credential(settings: Settings): string {
-  if (settings.apiKey) return settings.apiKey;
-  const [tokenFile, ...rest] = settings.credentialSources ?? [];
-  const fromFile = tokenFile?.();
-  if (fromFile) return fromFile;
-  if (settings.envApiKey) return settings.envApiKey;
-  if (settings.replicaToken) return settings.replicaToken;
-  for (const source of rest) {
-    const found = source();
-    if (found) return found;
-  }
+  const found = settings.apiKey || settings.readTokenFile?.() || settings.envApiKey || settings.replicaToken || settings.readLogin?.();
+  if (found) return found;
+  throw new SurfraFailure("no credential: set SURFRA_API_KEY or run `surfra login`");
+}
+
+/** The credential for control-plane calls: never the volumes token, which only the volumes service accepts. */
+export function controlCredential(settings: Settings): string {
+  const found = settings.apiKey || settings.envApiKey || settings.readLogin?.();
+  if (found) return found;
   throw new SurfraFailure("no credential: set SURFRA_API_KEY or run `surfra login`");
 }
 

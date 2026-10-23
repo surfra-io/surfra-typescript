@@ -11,11 +11,11 @@ import { homedir, tmpdir } from "node:os";
 import * as nodePath from "node:path";
 import { Readable } from "node:stream";
 
-import { Client as BaseClient } from "./client.js";
+import { App as BaseApp, Client as BaseClient, Workflow as BaseWorkflow } from "./client.js";
 import { processEnv, settingsFromEnv, SurfraError, type Settings } from "./core.js";
 import { Volume as BaseVolume, type Entry, type Mode } from "./volume.js";
 
-export { Call, Job, type JobSpec } from "./client.js";
+export { Call, Job, type AppSpec, type JobSpec } from "./client.js";
 export { SurfraError, SurfraFailure, type Settings } from "./core.js";
 export type { Entry, Mode, Body } from "./volume.js";
 
@@ -48,18 +48,15 @@ export function nodeSettingsFromEnv(overrides: Partial<NodeSettings> = {}): Node
     loginFile: nodePath.join(homedir(), ".surfra", "config.json"),
     ...overrides,
   };
-  base.credentialSources = [
-    () => (base.tokenFile ? readText(base.tokenFile)?.trim() || undefined : undefined),
-    () => {
-      if (!base.loginFile) return undefined;
-      const text = readText(base.loginFile);
-      try {
-        return text ? JSON.parse(text).token : undefined;
-      } catch {
-        return undefined;
-      }
-    },
-  ];
+  base.readTokenFile = () => (base.tokenFile ? readText(base.tokenFile)?.trim() || undefined : undefined);
+  base.readLogin = () => {
+    const text = base.loginFile ? readText(base.loginFile) : undefined;
+    try {
+      return text ? JSON.parse(text).token : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   return base;
 }
 
@@ -67,6 +64,20 @@ export function nodeSettingsFromEnv(overrides: Partial<NodeSettings> = {}): Node
 export class Client extends BaseClient {
   constructor(settings: Partial<NodeSettings> = {}) {
     super(nodeSettingsFromEnv(settings));
+  }
+}
+
+/** A deployed app by name, with Node's credential sources. */
+export class App extends BaseApp {
+  constructor(name: string, settings: Partial<NodeSettings> = {}) {
+    super(name, nodeSettingsFromEnv(settings));
+  }
+}
+
+/** A saved workflow by name, with Node's credential sources. */
+export class Workflow extends BaseWorkflow {
+  constructor(name: string, settings: Partial<NodeSettings> = {}) {
+    super(name, nodeSettingsFromEnv(settings));
   }
 }
 
@@ -231,7 +242,7 @@ export class Volume extends BaseVolume {
   sync(path: string, mode: Mode, refresh: boolean): Promise<string> {
     return this.serial(async () => {
       const root = this.root();
-      const target = nodePath.join(root, path);
+      const target = nodePath.join(root, path).replace(/[\\/]+$/, "");
       const previous = this.synced.get(path);
       if (previous && !refresh) {
         this.synced.set(path, previous === mode ? previous : "rw");

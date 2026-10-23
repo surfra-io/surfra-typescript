@@ -1,6 +1,6 @@
 // Volumes over HTTP, for every runtime. The Node build adds local sync on top (see node.ts).
 
-import { checked, credential, encodePath, settingsFromEnv, SurfraError, type Settings } from "./core.js";
+import { checked, controlCredential, credential, encodePath, settingsFromEnv, SurfraError, type Settings } from "./core.js";
 
 export type Mode = "r" | "w" | "rw";
 
@@ -73,7 +73,7 @@ export class Volume {
   }
 
   protected async control(method: string, route: string, json?: unknown): Promise<any> {
-    const headers: Record<string, string> = { Authorization: `Bearer ${credential(this.settings)}` };
+    const headers: Record<string, string> = { Authorization: `Bearer ${controlCredential(this.settings)}` };
     if (json !== undefined) headers["Content-Type"] = "application/json";
     const response = await fetch(`${this.settings.master}${route}`, { method, headers, body: json === undefined ? undefined : JSON.stringify(json) });
     return (await checked(response)).json();
