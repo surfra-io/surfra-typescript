@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { App, Client, SurfraError, SurfraFailure, Volume, Workflow } from "../dist/node.js";
+import { App, Call, Client, SurfraError, SurfraFailure, Volume, Workflow } from "../dist/node.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUITE = process.env.SURFRA_SDK_TESTS ?? path.join(HERE, "..", "..", "surfra-sdk-tests");
@@ -201,6 +201,16 @@ test("a02_enqueue_then_result", { skip }, async (t) => {
   const client = new Client(fake.settings);
   assert.deepEqual(await (await client.enqueue("embed", { n: 1 })).result({ timeoutMs: 30000 }), { app: "embed", echo: { n: 1 } });
   await assert.rejects((await client.enqueue("fails", {})).result({ timeoutMs: 30000 }), /ValueError/);
+});
+
+test("a06_submit_a_graph_and_wait", { skip }, async (t) => {
+  const fake = await start(t);
+  const client = new Client(fake.settings);
+  const view = await client.submit([
+    { name: "a", app_name: "embed", depends_on: [], input: { n: 1 } },
+    { name: "b", app_name: "rerank", depends_on: ["a"], input: {} },
+  ]);
+  assert.deepEqual(await new Call(client, view).result({ timeoutMs: 30000 }), { a: { app: "embed", echo: { n: 1 } }, b: { app: "rerank", echo: {} } });
 });
 
 test("j01_job_with_volumes_finishes", { skip }, async (t) => {
