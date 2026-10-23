@@ -139,6 +139,13 @@ export class Workflow {
     this.client = new Client(settings);
   }
 
+  /** Save the stages, such as { name: "summarize", app: "summarize", depends: ["transcribe"] }. */
+  deploy(stages: { name: string; app: string; depends?: string[] }[]): Promise<any> {
+    return this.client.call("PUT", `/v1/workflows/${encodeURIComponent(this.name)}`, {
+      stages: stages.map((stage) => ({ depends: [], ...stage })),
+    });
+  }
+
   /** Start one run. Stages with no dependencies receive input. */
   async enqueue(input: unknown = {}): Promise<Call> {
     const saved = await this.client.call("GET", `/v1/workflows/${encodeURIComponent(this.name)}`);

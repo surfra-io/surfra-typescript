@@ -263,6 +263,13 @@ test("w01_workflow_run_returns_each_stage", { skip }, async (t) => {
   assert.deepEqual(await new Workflow("pipeline", fake.settings).run({ q: "hi" }, { timeoutMs: 30000 }), { a: { app: "embed", echo: { q: "hi" } }, b: { app: "rerank", echo: {} } });
 });
 
+test("w02_workflow_deploy_saves_stages", { skip }, async (t) => {
+  const fake = await start(t);
+  const flow = new Workflow("solo", fake.settings);
+  await flow.deploy([{ name: "only", app: "embed" }]);
+  assert.deepEqual(await flow.run({ q: "hi" }, { timeoutMs: 30000 }), { app: "embed", echo: { q: "hi" } });
+});
+
 test("j02_job_logs_oldest_first", { skip }, async (t) => {
   const fake = await start(t);
   const job = await new Client(fake.settings).submitJob({ entrypoint: "echo hi", image: "img", providers: [{ provider: "local" }] });
