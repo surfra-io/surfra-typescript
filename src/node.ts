@@ -5,18 +5,18 @@
 //
 // The sync cache layout is shared with every Surfra SDK, so Node and Python code in one container agree.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import * as nodePath from "node:path";
 import { Readable } from "node:stream";
 
 import { App as BaseApp, Client as BaseClient, Workflow as BaseWorkflow } from "./client.js";
-import { processEnv, settingsFromEnv, SurfraError, type Settings } from "./core.js";
+import { processEnv, settingsFromEnv, signalFor, SurfraError, type RequestOptions, type Settings } from "./core.js";
 import { Volume as BaseVolume, type Entry, type Mode } from "./volume.js";
 
-export { Call, Job, type AppSpec, type JobSpec } from "./client.js";
-export { SurfraError, SurfraFailure, type Settings } from "./core.js";
+export { Call, Job, type AppSpec, type JobSpec, type SubmitOptions, type WaitOptions } from "./client.js";
+export { SurfraError, SurfraFailure, type RequestOptions, type Settings } from "./core.js";
 export type { Entry, Mode, Body } from "./volume.js";
 
 const DOWNLOADS = 8;
@@ -24,18 +24,56 @@ const DOWNLOADS = 8;
 export interface NodeSettings extends Settings {
   /** Where local() keeps synced files. `SURFRA_VOLUME_CACHE`, default <temp dir>/surfra. */
   cache: string;
-  /** `SURFRA_VOLUMES_TOKEN_FILE`, read on every request. */
+  /** `SURFRA_VOLUMES_TOKEN_FILE`. Re-read when it changes, so a rotated token is picked up. */
   tokenFile?: string;
   /** The session `surfra login` saved. */
   loginFile?: string;
+  /**
+   * How long a credential file read is trusted before the file is checked again, default 1000 ms.
+   * After that, a stat; the file is read again only when its mtime or size changed.
+   */
+  credentialCacheMs?: number;
 }
 
-function readText(path: string): string | undefined {
+const CREDENTIAL_CACHE_MS = 1000;
+
+interface Cached {
+  text: string | undefined;
+  checked: number;
+  stamp: string | undefined;
+}
+
+function stamp(path: string): string | undefined {
   try {
-    return readFileSync(path, "utf8");
+    const stat = statSync(path, { bigint: true });
+    return `${stat.mtimeNs}:${stat.size}:${stat.ino}`;
   } catch {
     return undefined;
   }
+}
+
+/** A reader of one file that reads it only when it may have changed: a stat at most every ttlMs, a read when the stat differs. */
+function cachedReader(path: () => string | undefined, ttlMs: () => number): () => string | undefined {
+  let cached: (Cached & { path: string }) | undefined;
+  return () => {
+    const file = path();
+    if (!file) return undefined;
+    const now = Date.now();
+    if (cached && cached.path === file && now - cached.checked < ttlMs()) return cached.text;
+    const current = stamp(file);
+    if (!cached || cached.path !== file || current !== cached.stamp) {
+      let text: string | undefined;
+      try {
+        text = current === undefined ? undefined : readFileSync(file, "utf8");
+      } catch {
+        text = undefined;
+      }
+      cached = { path: file, text, checked: now, stamp: current };
+    } else {
+      cached.checked = now;
+    }
+    return cached.text;
+  };
 }
 
 /** Node settings from the environment: everything in Settings, plus the cache and file credentials. */
@@ -48,9 +86,12 @@ export function nodeSettingsFromEnv(overrides: Partial<NodeSettings> = {}): Node
     loginFile: nodePath.join(homedir(), ".surfra", "config.json"),
     ...overrides,
   };
-  base.readTokenFile = () => (base.tokenFile ? readText(base.tokenFile)?.trim() || undefined : undefined);
+  const ttl = () => base.credentialCacheMs ?? CREDENTIAL_CACHE_MS;
+  const tokenText = cachedReader(() => base.tokenFile, ttl);
+  const loginText = cachedReader(() => base.loginFile, ttl);
+  base.readTokenFile = () => tokenText()?.trim() || undefined;
   base.readLogin = () => {
-    const text = base.loginFile ? readText(base.loginFile) : undefined;
+    const text = loginText();
     try {
       return text ? JSON.parse(text).token : undefined;
     } catch {
@@ -132,19 +173,20 @@ export class VolumePath {
   constructor(readonly volume: Volume, readonly path: string) {}
 
   /** Download this piece into the local cache and return its real path. */
-  local({ mode = "r", refresh = false }: { mode?: Mode; refresh?: boolean } = {}): Promise<string> {
-    return this.volume.sync(this.path, mode, refresh);
+  local({ mode = "r", refresh = false, ...options }: { mode?: Mode; refresh?: boolean } & RequestOptions = {}): Promise<string> {
+    return this.volume.sync(this.path, mode, refresh, options);
   }
 
-  /** A plain copy into dest, outside the sync cache. */
-  async download(dest: string): Promise<string> {
+  /** A plain copy into dest, outside the sync cache. `timeoutMs` bounds the whole copy. */
+  async download(dest: string, options: RequestOptions = {}): Promise<string> {
+    const signal = signalFor(options);
     if (isFolder(this.path)) {
-      for (const entry of await this.volume.ls(this.path, { recursive: true })) {
-        await this.volume.downloadTo(entry.path, nodePath.join(dest, entry.path.slice(this.path.length)));
+      for (const entry of await this.volume.ls(this.path, { recursive: true, signal })) {
+        await this.volume.downloadTo(entry.path, nodePath.join(dest, entry.path.slice(this.path.length)), { signal });
       }
     } else {
       const isDir = await fs.stat(dest).then((stat) => stat.isDirectory()).catch(() => false);
-      await this.volume.downloadTo(this.path, isDir ? nodePath.join(dest, nodePath.basename(this.path)) : dest);
+      await this.volume.downloadTo(this.path, isDir ? nodePath.join(dest, nodePath.basename(this.path)) : dest, { signal });
     }
     return dest;
   }
@@ -165,36 +207,39 @@ export class Volume extends BaseVolume {
   }
 
   /** Upload one local file. Files over the part size go up in parts, read a part at a time. */
-  async putFile(local: string, remote: string): Promise<Entry> {
+  async putFile(local: string, remote: string, options: RequestOptions = {}): Promise<Entry> {
+    const signal = signalFor(options);
     const { size } = await fs.stat(local);
-    if (size <= this.settings.partBytes) return this.write(remote, await fs.readFile(local));
+    if (size <= this.settings.partBytes) return this.write(remote, await fs.readFile(local, { signal }), { signal });
     const handle = await fs.open(local, "r");
     try {
       return await this.multipart(remote, size, async (start, end) => {
         const chunk = Buffer.alloc(end - start);
         await handle.read(chunk, 0, chunk.length, start);
         return chunk;
-      });
+      }, { signal });
     } finally {
       await handle.close();
     }
   }
 
   /** Upload a folder's files under remote. Returns how many were uploaded. */
-  async putDirectory(local: string, remote = ""): Promise<number> {
+  async putDirectory(local: string, remote = "", options: RequestOptions = {}): Promise<number> {
+    const signal = signalFor(options);
     const prefix = remote === "" || remote.endsWith("/") ? remote : `${remote}/`;
     const files = (await walk(local)).sort();
-    await inPool(files, 4, (file) => this.putFile(file, prefix + nodePath.relative(local, file).split(nodePath.sep).join("/")));
+    await inPool(files, 4, (file) => this.putFile(file, prefix + nodePath.relative(local, file).split(nodePath.sep).join("/"), { signal }));
     return files.length;
   }
 
   /** @internal Download one file to a path, through a temporary file. */
-  async downloadTo(remote: string, target: string): Promise<void> {
+  async downloadTo(remote: string, target: string, options: RequestOptions = {}): Promise<void> {
+    const signal = signalFor(options);
     await fs.mkdir(nodePath.dirname(target), { recursive: true });
     const temp = nodePath.join(nodePath.dirname(target), `.surfra-${process.pid}-${Math.random().toString(36).slice(2)}`);
     try {
-      const body = await this.stream(remote);
-      await fs.writeFile(temp, Readable.fromWeb(body as any));
+      const body = await this.stream(remote, { signal });
+      await fs.writeFile(temp, Readable.fromWeb(body as any), { signal });
       await fs.rename(temp, target);
     } catch (error) {
       await fs.rm(temp, { force: true });
@@ -231,16 +276,18 @@ export class Volume extends BaseVolume {
     return run;
   }
 
-  private async head(path: string): Promise<Entry[]> {
-    const response = await this.send("HEAD", `files/${path.split("/").map(encodeURIComponent).join("/")}`);
+  private async head(path: string, signal?: AbortSignal): Promise<Entry[]> {
+    const response = await this.send("HEAD", `files/${path.split("/").map(encodeURIComponent).join("/")}`, { signal });
     if (response.status === 404) return [];
     if (!response.ok) throw new SurfraError(response.status, response.statusText);
     return [{ path, size: Number(response.headers.get("content-length") ?? 0), etag: response.headers.get("etag") ?? "", modified: response.headers.get("last-modified") ?? "" }];
   }
 
   /** @internal */
-  sync(path: string, mode: Mode, refresh: boolean): Promise<string> {
+  sync(path: string, mode: Mode, refresh: boolean, options: RequestOptions = {}): Promise<string> {
+    const signal = signalFor(options);
     return this.serial(async () => {
+      signal?.throwIfAborted();
       const root = this.root();
       const target = nodePath.join(root, path).replace(/[\\/]+$/, "");
       const previous = this.synced.get(path);
@@ -256,14 +303,14 @@ export class Volume extends BaseVolume {
         return target;
       }
       const state = await this.loadState();
-      const remote = new Map((folder ? await this.ls(path, { recursive: true }) : await this.head(path)).map((entry) => [entry.path, entry]));
+      const remote = new Map((folder ? await this.ls(path, { recursive: true, signal }) : await this.head(path, signal)).map((entry) => [entry.path, entry]));
       const changed: Entry[] = [];
       for (const entry of remote.values()) {
         const known = state.get(entry.path);
         const local = await mtimeNs(nodePath.join(root, entry.path));
         if (!known || known.etag !== entry.etag || !local || local.size !== entry.size || local.mtime_ns !== known.mtime_ns) changed.push(entry);
       }
-      await inPool(changed, DOWNLOADS, (entry) => this.downloadTo(entry.path, nodePath.join(root, entry.path)));
+      await inPool(changed, DOWNLOADS, (entry) => this.downloadTo(entry.path, nodePath.join(root, entry.path), { signal }));
       for (const entry of changed) {
         const local = await mtimeNs(nodePath.join(root, entry.path));
         state.set(entry.path, { etag: entry.etag, size: entry.size, mtime_ns: local?.mtime_ns ?? 0n });
@@ -283,8 +330,10 @@ export class Volume extends BaseVolume {
   }
 
   /** Upload what changed in every folder synced with mode "w" or "rw". */
-  commit(): Promise<{ uploaded: number; deleted: number }> {
+  commit(options: RequestOptions = {}): Promise<{ uploaded: number; deleted: number }> {
+    const signal = signalFor(options);
     return this.serial(async () => {
+      signal?.throwIfAborted();
       const state = await this.loadState();
       const root = this.root();
       let uploaded = 0;
@@ -302,7 +351,7 @@ export class Volume extends BaseVolume {
           const local = (await mtimeNs(file))!;
           const known = state.get(remote);
           if (known && known.size === local.size && known.mtime_ns === local.mtime_ns) continue;
-          const entry = await this.putFile(file, remote);
+          const entry = await this.putFile(file, remote, { signal });
           state.set(remote, { etag: entry.etag, size: entry.size, mtime_ns: local.mtime_ns });
           uploaded++;
         }
@@ -310,7 +359,7 @@ export class Volume extends BaseVolume {
           for (const key of [...state.keys()]) {
             const inside = folder ? key.startsWith(path) : key === path;
             if (!inside || seen.has(key)) continue;
-            await this.rm(key).catch((error) => {
+            await this.rm(key, { signal }).catch((error) => {
               if (!(error instanceof SurfraError && error.status === 404)) throw error;
             });
             state.delete(key);
@@ -324,8 +373,8 @@ export class Volume extends BaseVolume {
   }
 
   /** Every volume in the organization. */
-  static async list(settings: Partial<NodeSettings> = {}): Promise<any[]> {
-    return BaseVolume.list(nodeSettingsFromEnv(settings));
+  static async list(settings: Partial<NodeSettings> = {}, options: RequestOptions = {}): Promise<any[]> {
+    return BaseVolume.list(nodeSettingsFromEnv(settings), options);
   }
 }
 

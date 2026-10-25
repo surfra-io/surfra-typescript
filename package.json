@@ -1,6 +1,6 @@
 {
   "name": "surfra",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Surfra SDK: volumes, apps and jobs on serverless GPUs across your own clouds",
   "license": "Apache-2.0",
   "homepage": "https://docs.surfra.io",
@@ -8,7 +8,7 @@
   "keywords": ["gpu", "serverless", "inference", "storage", "ml", "surfra"],
   "type": "module",
   "engines": { "node": ">=18" },
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
   "exports": {
     ".": {
       "node": { "types": "./dist/node.d.ts", "default": "./dist/node.js" },

@@ -20,6 +20,36 @@ const call = await client.enqueue("sdxl", { prompt: "a lighthouse" });
 const image = await call.result();
 ```
 
+## Cancel and time out
+
+Every network method takes an optional `{ signal, timeoutMs }` beside its own options. A cancelled call
+rejects with the signal's reason: an `AbortError`, or a `TimeoutError` when the time runs out.
+
+```ts
+const controller = new AbortController();
+const call = await client.enqueue("sdxl", { prompt: "a lighthouse" }, { signal: controller.signal });
+button.onclick = () => controller.abort();          // stops waiting at once, even mid-request
+const image = await call.result({ signal: controller.signal, timeoutMs: 600_000 });
+
+const info = await new App("embed").info({ timeoutMs: 5_000 });   // TimeoutError after 5 s
+```
+
+On `result`, `run` and `job.wait`, `timeoutMs` bounds the whole wait, including a request in flight, and
+throws `SurfraFailure` (with the `TimeoutError` as `cause`) as before. Each control-plane request also has
+its own limit, 60 s by default: set `requestTimeoutMs` on `Client`, `App`, `Workflow` or `Volume`, or `0`
+for none. Volume uploads and downloads have no default limit; pass `timeoutMs` or a `signal`.
+
+`AbortSignal.any` is used where the runtime has it, and a small fallback where it does not.
+
+## Callbacks
+
+```ts
+await client.enqueue("embed", { texts: ["hi"] }, { callbackUrl: "https://example.com/hooks/surfra" });
+```
+
+`callbackUrl` (on `submit`, `enqueue` and `run`, for apps and workflows) is stored with the transaction;
+delivery is planned.
+
 ## Volumes
 
 ```ts
@@ -61,6 +91,9 @@ pass a key you are comfortable exposing, or call your own backend instead.
 
 The order is the same in every Surfra SDK: an explicit key, `SURFRA_VOLUMES_TOKEN_FILE`, `SURFRA_API_KEY`,
 `SURFRA_REPLICA_TOKEN`, then the session `surfra login` saved.
+
+In Node, the token file and the saved login are read once and reused; the file is checked again at most
+once a second (`credentialCacheMs`), and read again only when it changed, so a rotated token is picked up.
 
 ## Tests
 

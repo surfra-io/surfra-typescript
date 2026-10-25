@@ -4,6 +4,8 @@
 export const DEFAULT_MASTER = "https://api.surfra.io";
 export const DEFAULT_VOLUMES = "https://volumes.surfra.io";
 export const PART_BYTES = 64 * 1024 * 1024;
+/** How long one control-plane request may take before it is aborted with a TimeoutError. */
+export const REQUEST_TIMEOUT_MS = 60_000;
 
 /** Surfra refused a request. `status` is the HTTP code, `detail` the reason it gave. */
 export class SurfraError extends Error {
@@ -19,8 +21,8 @@ export class SurfraError extends Error {
 
 /** No credential was found, or a call or job did not finish as hoped. */
 export class SurfraFailure extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "SurfraFailure";
   }
 }
@@ -34,6 +36,12 @@ export interface Settings {
   volumesUrl: string;
   /** The largest single upload; larger files go in parts. `SURFRA_VOLUMES_PART_BYTES`, default 64 MiB. */
   partBytes: number;
+  /**
+   * The longest one control-plane request may take, in milliseconds, default 60 000. A request that
+   * takes longer is aborted with a `TimeoutError`. `0` turns it off. Volume transfers have no default
+   * limit: pass `timeoutMs` or a `signal` to bound them.
+   */
+  requestTimeoutMs?: number;
   /** `SURFRA_API_KEY`. */
   envApiKey?: string;
   /** `SURFRA_REPLICA_TOKEN`. */
@@ -100,4 +108,82 @@ export function encodePath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * Options every network method takes, alongside its own. `signal` cancels the call; `timeoutMs` bounds it,
+ * including retries, polling and any request in flight. A cancelled call rejects with the signal's reason:
+ * an `AbortError` from `AbortController.abort()`, a `TimeoutError` when `timeoutMs` (or the per-request
+ * limit) runs out. `Call.result`, `run` and `Job.wait` keep their `SurfraFailure` when `timeoutMs` runs out.
+ */
+export interface RequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("This operation was aborted", "AbortError");
+}
+
+/** A signal that aborts with a `TimeoutError` after ms. */
+export function timeoutSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal.timeout === "function") return AbortSignal.timeout(ms);
+  const controller = new AbortController();
+  const timer: any = setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), ms);
+  timer?.unref?.();
+  return controller.signal;
+}
+
+/** @internal AbortSignal.any for runtimes that lack it (Node before 18.17 and 20.3, older browsers). */
+export function combineSignals(signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  const found = signals.find((signal) => signal.aborted);
+  if (found) {
+    controller.abort(abortReason(found));
+    return controller.signal;
+  }
+  const onAbort = (event: Event) => {
+    for (const signal of signals) signal.removeEventListener("abort", onAbort);
+    controller.abort(abortReason(event.target as AbortSignal));
+  };
+  for (const signal of signals) signal.addEventListener("abort", onAbort);
+  return controller.signal;
+}
+
+/** One signal that aborts when any of these does. */
+export function anySignal(signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (present.length <= 1) return present[0];
+  const native = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  return typeof native === "function" ? native.call(AbortSignal, present) : combineSignals(present);
+}
+
+/** The signal for one call: the caller's signal, plus timeoutMs (or fallbackMs) when set. `0` means no limit. */
+export function signalFor({ signal, timeoutMs }: RequestOptions = {}, fallbackMs?: number): AbortSignal | undefined {
+  const ms = timeoutMs ?? fallbackMs;
+  return anySignal([signal, ms ? timeoutSignal(ms) : undefined]);
+}
+
+/** Run work; if signal aborted meanwhile, reject with its reason, so the AbortError or TimeoutError name survives. */
+export async function guarded<T>(signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (signal?.aborted) throw abortReason(signal);
+    throw error;
+  }
+}
+
+/** Wait ms, or reject with the signal's reason as soon as it aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortReason(signal));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal!));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
