@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { App, Call, Client, SurfraError, SurfraFailure, Volume, Workflow } from "../dist/node.js";
+import { App, Call, Client, SurfraError, SurfraFailure, Volume, verifyWebhook, WebhookVerificationError, Workflow } from "../dist/node.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SUITE = process.env.SURFRA_SDK_TESTS ?? path.join(HERE, "..", "..", "surfra-sdk-tests");
@@ -284,4 +284,24 @@ test("j02_job_logs_oldest_first", { skip }, async (t) => {
   const fake = await start(t);
   const job = await new Client(fake.settings).submitJob({ entrypoint: "echo hi", image: "img", providers: [{ provider: "local" }] });
   assert.deepEqual((await job.logs()).map((line) => line.m), ["line 0", "line 1", "line 2"]);
+});
+
+const skipWebhooks = !existsSync(path.join(SUITE, "webhooks.json")) && "surfra-sdk-tests is not checked out";
+
+test("h01_callback_signatures_verify_or_reject", { skip: skipWebhooks }, async () => {
+  const vectors = JSON.parse(await fs.readFile(path.join(SUITE, "webhooks.json"), "utf8"));
+  assert.ok(vectors.cases.length > 0);
+  for (const item of vectors.cases) {
+    const verify = () => verifyWebhook(item.body, item.signature, item.secret, { now: item.now, toleranceSeconds: vectors.tolerance_seconds });
+    if (item.ok) {
+      const payload = await verify();
+      assert.deepEqual(payload, JSON.parse(item.body), item.name);
+      assert.equal(payload.seq, 7, item.name);
+      // The same case through a header object and as raw bytes, with the default tolerance.
+      const bytes = new TextEncoder().encode(item.body);
+      assert.equal((await verifyWebhook(bytes, { "X-Surfra-Signature": item.signature }, item.secret, { now: item.now })).seq, 7, item.name);
+    } else {
+      await assert.rejects(verify, WebhookVerificationError, item.name);
+    }
+  }
 });

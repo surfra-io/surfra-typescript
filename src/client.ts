@@ -6,7 +6,7 @@ export type { RequestOptions } from "./core.js";
 
 /** Options for starting a transaction. */
 export interface SubmitOptions extends RequestOptions {
-  /** A URL Surfra should call when the transaction ends. Stored with the transaction; delivery is planned. */
+  /** Surfra POSTs the task's latest state to this URL each time it changes. Check it with verifyWebhook. */
   callbackUrl?: string;
 }
 

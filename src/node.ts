@@ -5,6 +5,7 @@
 //
 // The sync cache layout is shared with every Surfra SDK, so Node and Python code in one container agree.
 
+import { webcrypto } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -14,10 +15,14 @@ import { Readable } from "node:stream";
 import { App as BaseApp, Client as BaseClient, Workflow as BaseWorkflow } from "./client.js";
 import { processEnv, settingsFromEnv, signalFor, SurfraError, type RequestOptions, type Settings } from "./core.js";
 import { Volume as BaseVolume, type Entry, type Mode } from "./volume.js";
+import { useSubtleCrypto } from "./webhooks.js";
 
 export { Call, Job, type AppSpec, type JobSpec, type SubmitOptions, type WaitOptions } from "./client.js";
 export { SurfraError, SurfraFailure, type RequestOptions, type Settings } from "./core.js";
 export type { Entry, Mode, Body } from "./volume.js";
+export { verifyWebhook, WebhookVerificationError, type CallbackPayload, type VerifyWebhookOptions } from "./webhooks.js";
+
+useSubtleCrypto(webcrypto.subtle as SubtleCrypto);
 
 const DOWNLOADS = 8;
 

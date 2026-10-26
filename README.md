@@ -47,8 +47,34 @@ for none. Volume uploads and downloads have no default limit; pass `timeoutMs` o
 await client.enqueue("embed", { texts: ["hi"] }, { callbackUrl: "https://example.com/hooks/surfra" });
 ```
 
-`callbackUrl` (on `submit`, `enqueue` and `run`, for apps and workflows) is stored with the transaction;
-delivery is planned.
+`callbackUrl` (on `submit`, `enqueue` and `run`, for apps and workflows): Surfra POSTs the task's latest
+state there each time it changes, signed with `X-Surfra-Signature`.
+
+### Verify callbacks
+
+Each callback carries `X-Surfra-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256>`. Verify it against the
+raw body bytes, before any JSON parsing:
+
+```ts
+import express from "express";
+import { verifyWebhook, WebhookVerificationError } from "surfra";
+
+const app = express();
+app.post("/hooks/surfra", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const event = await verifyWebhook(req.body, req.headers, process.env.SURFRA_WEBHOOK_SECRET!);
+    console.log(event.seq, event.task.id, event.task.status);
+    res.sendStatus(204);
+  } catch (err) {
+    if (err instanceof WebhookVerificationError) return res.sendStatus(400);
+    throw err;
+  }
+});
+```
+
+`headers` may be a `Headers` object (Fetch, Workers), a plain header object, or the header value. While
+rotating the signing secret, pass both: `verifyWebhook(body, headers, [newSecret, oldSecret])`. Timestamps
+more than 300 s from now are rejected; change that with `{ toleranceSeconds }`.
 
 ## Volumes
 
