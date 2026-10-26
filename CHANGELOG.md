@@ -4,6 +4,14 @@ All notable changes to this package are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-26
+
+### Added
+- `verifyWebhook(body, headers, secret, { toleranceSeconds })` checks a callback's `X-Surfra-Signature`
+  (HMAC-SHA256 over `<t>.<raw body>`, constant-time, any of several secrets or `v1=` parts during
+  rotation, 300 s timestamp tolerance) and returns the parsed `CallbackPayload`; failures throw
+  `WebhookVerificationError`. Uses Web Crypto, on both entry points.
+
 ## [0.2.0] - 2026-10-25
 
 ### Added
@@ -15,10 +23,6 @@ All notable changes to this package are documented here. The format follows
   it off), so a hung request can no longer hang a call forever. Volume transfers have no default limit.
 - `callbackUrl` on `Client.submit`/`enqueue`/`run`, `App.enqueue`/`run` and `Workflow.enqueue`/`run`,
   sent as `callback_url`: Surfra POSTs the task's latest state there each time it changes.
-- `verifyWebhook(body, headers, secret, { toleranceSeconds })` checks a callback's `X-Surfra-Signature`
-  (HMAC-SHA256 over `<t>.<raw body>`, constant-time, any of several secrets or `v1=` parts during
-  rotation, 300 s timestamp tolerance) and returns the parsed `CallbackPayload`; failures throw
-  `WebhookVerificationError`. Uses Web Crypto, on both entry points.
 - `credentialCacheMs` Node setting (default 1000 ms).
 - Exported types `RequestOptions`, `SubmitOptions` and `WaitOptions`.
 
