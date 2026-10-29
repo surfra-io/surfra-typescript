@@ -305,3 +305,149 @@ test("h01_callback_signatures_verify_or_reject", { skip: skipWebhooks }, async (
     }
   }
 });
+
+// Retries: CASES.md "Retries", r01–r12. Faults are injected with POST /_test/faults.
+
+const SUBMIT = { method: "POST", path: "/v1/transactions" };
+const POLL = { method: "GET", path: "/v1/transactions/" };
+
+function refusal(status, type, retryAfter) {
+  const fault = { status, body: { detail: type.toLowerCase(), error: { type, message: type.toLowerCase() } } };
+  if (retryAfter !== undefined) {
+    fault.body.error.retry_after = retryAfter;
+    fault.headers = { "Retry-After": String(retryAfter) };
+  }
+  return fault;
+}
+
+async function faults(fake, ...items) {
+  await fetch(`${fake.url}/_test/faults`, { method: "POST", body: JSON.stringify({ faults: items }) });
+}
+
+async function count(fake, method, prefix) {
+  return (await fake.requests()).filter((item) => item.method === method && item.path.startsWith(prefix)).length;
+}
+
+test("r01_rate_limited_waits_retry_after_then_succeeds", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, ...refusal(429, "RATE_LIMITED", 1) });
+  const started = Date.now();
+  assert.deepEqual(await new Client(fake.settings).run("embed", { n: 1 }, { timeoutMs: 30000 }), { app: "embed", echo: { n: 1 } });
+  assert.ok(Date.now() - started >= 900);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 2);
+});
+
+test("r02_queue_full_is_retried", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, ...refusal(503, "QUEUE_FULL", 0) });
+  assert.deepEqual(await new Client(fake.settings).run("embed", {}, { timeoutMs: 30000 }), { app: "embed", echo: {} });
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 2);
+});
+
+test("r03_server_busy_on_a_get_is_retried", { skip }, async (t) => {
+  const fake = await start(t);
+  const call = await new Client(fake.settings).enqueue("embed", { n: 3 });
+  await faults(fake, { ...POLL, ...refusal(503, "SERVER_BUSY", 0) });
+  assert.deepEqual(await call.result({ timeoutMs: 30000 }), { app: "embed", echo: { n: 3 } });
+});
+
+for (const [id, type] of [["r04_app_paused_is_not_retried", "APP_PAUSED"], ["r05_defcon_active_is_not_retried", "DEFCON_ACTIVE"]]) {
+  test(id, { skip }, async (t) => {
+    const fake = await start(t);
+    await faults(fake, { ...SUBMIT, ...refusal(503, type) });
+    const error = await new Client(fake.settings).enqueue("embed", {}).catch((caught) => caught);
+    assert.ok(error instanceof SurfraError);
+    assert.deepEqual([error.status, error.type, error.attempts], [503, type, 1]);
+    assert.equal(await count(fake, "POST", "/v1/transactions"), 1);
+  });
+}
+
+test("r13_http_calls_limit_is_not_retried", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, ...refusal(402, "HTTP_CALLS_LIMIT") });
+  const error = await new Client(fake.settings).enqueue("embed", {}).catch((caught) => caught);
+  assert.ok(error instanceof SurfraError);
+  assert.deepEqual([error.status, error.type, error.attempts], [402, "HTTP_CALLS_LIMIT", 1]);
+  assert.ok(error.message);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 1);
+});
+
+test("r06_a_plain_502_is_retried_on_get_only", { skip }, async (t) => {
+  const fake = await start(t);
+  const client = new Client(fake.settings);
+  const call = await client.enqueue("embed", {});
+  await faults(fake, { ...POLL, status: 502, raw: "<html>bad gateway</html>" });
+  assert.deepEqual(await call.result({ timeoutMs: 30000 }), { app: "embed", echo: {} });
+  await faults(fake, { ...SUBMIT, status: 502, raw: "<html>bad gateway</html>" });
+  const error = await client.enqueue("embed", {}).catch((caught) => caught);
+  assert.ok(error instanceof SurfraError);
+  assert.deepEqual([error.status, error.type, error.outcomeUnknown], [502, undefined, false]);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 2);
+});
+
+test("r07_a_plain_504_on_a_submit_is_an_unknown_outcome", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, status: 504, raw: "upstream timed out" });
+  const error = await new Client(fake.settings).enqueue("embed", {}).catch((caught) => caught);
+  assert.ok(error instanceof SurfraError);
+  assert.equal(error.status, 504);
+  assert.equal(error.outcomeUnknown, true);
+  assert.match(error.message, /may be running/);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 1);
+});
+
+test("r08_a_dropped_connection_is_retried_on_get_only", { skip }, async (t) => {
+  const fake = await start(t);
+  const client = new Client(fake.settings);
+  const call = await client.enqueue("embed", {});
+  await faults(fake, { ...POLL, drop: true });
+  assert.deepEqual(await call.result({ timeoutMs: 30000 }), { app: "embed", echo: {} });
+  await faults(fake, { ...SUBMIT, drop: true });
+  const error = await client.enqueue("embed", {}).catch((caught) => caught);
+  assert.ok(error instanceof SurfraFailure, String(error));
+  assert.equal(error.outcomeUnknown, true);
+  assert.match(error.message, /may be running/);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 2);
+});
+
+test("r09_a_400_is_not_retried", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, status: 400, body: { detail: "stages must be a list" } });
+  const error = await new Client(fake.settings).enqueue("embed", {}).catch((caught) => caught);
+  assert.deepEqual([error.status, error.attempts], [400, 1]);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 1);
+});
+
+test("r10_a_refused_connection_is_retried", { skip }, async () => {
+  const { createServer } = await import("node:net");
+  const port = await new Promise((resolve) => {
+    const probe = createServer().listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const events = [];
+  const client = new Client({ master: `http://127.0.0.1:${port}`, envApiKey: "sfk_test", tokenFile: undefined, loginFile: undefined, maxRetries: 2, onRetry: (event) => events.push(event) });
+  const error = await client.enqueue("embed", {}).catch((caught) => caught);
+  assert.ok(error instanceof SurfraFailure, String(error));
+  assert.equal(error.attempts, 3);
+  assert.equal(error.outcomeUnknown, false);
+  assert.deepEqual(events.map((event) => event.attempt), [1, 2]);
+});
+
+test("r11_retries_stop_after_max_retries", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, ...refusal(503, "SERVER_BUSY", 0), times: 10 });
+  const error = await new Client({ ...fake.settings, maxRetries: 2 }).enqueue("embed", {}).catch((caught) => caught);
+  assert.deepEqual([error.type, error.attempts], ["SERVER_BUSY", 3]);
+  assert.equal(await count(fake, "POST", "/v1/transactions"), 3);
+});
+
+test("r12_a_wait_past_the_deadline_is_not_taken", { skip }, async (t) => {
+  const fake = await start(t);
+  await faults(fake, { ...SUBMIT, ...refusal(429, "RATE_LIMITED", 30) });
+  const started = Date.now();
+  const error = await new Client(fake.settings).enqueue("embed", {}, { retryDeadlineMs: 2000 }).catch((caught) => caught);
+  assert.ok(Date.now() - started < 1500);
+  assert.deepEqual([error.type, error.retryAfter, error.attempts], ["RATE_LIMITED", 30, 1]);
+});

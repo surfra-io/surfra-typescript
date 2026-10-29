@@ -41,6 +41,42 @@ for none. Volume uploads and downloads have no default limit; pass `timeoutMs` o
 
 `AbortSignal.any` is used where the runtime has it, and a small fallback where it does not.
 
+## Errors and retries
+
+When Surfra can't take work right now, it refuses with a typed error and queues nothing, so the SDK
+retries it for you, after the `Retry-After` Surfra sends:
+
+| Status | `error.type` | Retried? |
+| --- | --- | --- |
+| 429 | `RATE_LIMITED`: your organization's per-minute limit | yes |
+| 503 | `QUEUE_FULL`: the app's queue is as long as its machines can clear soon | yes |
+| 503 | `SERVER_BUSY`: Surfra is short of database connections | yes |
+| 503 | `APP_PAUSED`, `DEFCON_ACTIVE`: the app is paused, or the kill switch is on | no |
+| 402 | `HTTP_CALLS_LIMIT`: this month's included HTTP calls are used up and the organization has no card on file. Add one in Settings, or wait for the month to turn | no |
+| 502/503/504 with no Surfra error | `undefined` | only reads (`GET`) |
+| a connection that never got through | `undefined` | yes |
+| other 4xx | | no |
+
+**Limits:** at most 7 retries (8 attempts) within 3 minutes of the first try. Without `Retry-After`, the
+waits back off exponentially with jitter (0.5 s base, 30 s cap). Set the limits per client or per call:
+
+```ts
+const client = new Client({ maxRetries: 3, retryDeadlineMs: 30_000, onRetry: (event) => console.warn(event) });
+await client.submit(stages, {}, { maxRetries: 0 });   // this call is never retried
+```
+
+`SURFRA_DEBUG=1` prints every retry with `console.warn`.
+
+**The final error:**
+- An answer from Surfra throws `SurfraError`, with `status`, `type`, `detail`, `attempts` and `retryAfter`.
+- A connection failure throws `SurfraFailure`, with the network error as `cause`, and `attempts`.
+
+**When the outcome is unknown:** a submission (a transaction or a job) that got a 504, or lost its
+connection after it was sent, is never retried, because it may already be running. Its error has
+`outcomeUnknown: true`.
+- Check for the work before submitting again.
+- For long work, prefer `enqueue()` then `result()`, or a `callbackUrl`, over one long call.
+
 ## Callbacks
 
 ```ts

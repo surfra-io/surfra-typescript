@@ -1,8 +1,8 @@
 // Calling apps and running jobs, for every runtime.
 
-import { anySignal, checked, controlCredential, guarded, REQUEST_TIMEOUT_MS, settingsFromEnv, signalFor, sleep, SurfraFailure, timeoutSignal, type RequestOptions, type Settings } from "./core.js";
+import { anySignal, controlRequest, guarded, signalFor, REQUEST_TIMEOUT_MS, settingsFromEnv, sleep, SurfraFailure, timeoutSignal, type RequestOptions, type Settings } from "./core.js";
 
-export type { RequestOptions } from "./core.js";
+export type { RequestOptions, RetryEvent, RetryOptions } from "./core.js";
 
 /** Options for starting a transaction. */
 export interface SubmitOptions extends RequestOptions {
@@ -58,43 +58,24 @@ export class Client {
     return this.settings.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   }
 
-  /** One control-plane request. `timeoutMs` replaces the per-request limit (default 60 s). */
+  /**
+   * One control-plane request, retried as the README's "Errors and retries" says. `timeoutMs` bounds the
+   * whole call, retries included, and replaces the per-request limit (default 60 s).
+   */
   async call(method: string, route: string, json?: unknown, options: RequestOptions = {}): Promise<any> {
-    const signal = signalFor(options, this.requestTimeoutMs);
-    return guarded(signal, async () => {
-      const headers: Record<string, string> = { Authorization: `Bearer ${controlCredential(this.settings)}` };
-      if (json !== undefined) headers["Content-Type"] = "application/json";
-      const response = await fetch(`${this.settings.master}${route}`, { method, headers, body: json === undefined ? undefined : JSON.stringify(json), signal });
-      return (await checked(response)).json();
-    });
+    return controlRequest(this.settings, method, route, json, options);
   }
 
   /**
-   * Start a transaction. Over the organization's request rate, waits as Surfra asks, up to five times.
-   * `timeoutMs` bounds the whole submit, waits included; each request also has the per-request limit.
+   * Start a transaction. Overload answers (429, QUEUE_FULL, SERVER_BUSY) are retried after the wait Surfra
+   * asks for. A plain 504 or a connection lost after sending is not retried: the error has
+   * `outcomeUnknown: true`, as the transaction may be running. `timeoutMs` bounds the whole submit, waits
+   * included; each request also has the per-request limit.
    */
   async submit(stages: unknown[], metadata: Record<string, unknown> = {}, options: SubmitOptions = {}): Promise<any> {
     const payload: Record<string, unknown> = { stages, metadata };
     if (options.callbackUrl !== undefined) payload.callback_url = options.callbackUrl;
-    const body = JSON.stringify(payload);
-    const whole = signalFor(options);
-    return guarded(whole, async () => {
-      for (let attempt = 0; ; attempt++) {
-        const signal = signalFor({ signal: whole }, this.requestTimeoutMs);
-        const response = await guarded(signal, () =>
-          fetch(`${this.settings.master}/v1/transactions`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${controlCredential(this.settings)}`, "Content-Type": "application/json" },
-            body,
-            signal,
-          }),
-        );
-        if (response.status !== 429 || attempt === RATE_RETRIES) return guarded(signal, async () => (await checked(response)).json());
-        await response.body?.cancel();
-        const wait = Math.min(60, Math.max(1, Number(response.headers.get("retry-after")) || 1));
-        await sleep(wait * 1000, whole);
-      }
-    });
+    return controlRequest(this.settings, "POST", "/v1/transactions", payload, options, { submission: true, keepAttemptLimit: true });
   }
 
   /** Queue one call to an app and return it before the app finishes. */
@@ -110,7 +91,7 @@ export class Client {
 
   /** Run a command once on one machine. */
   async submitJob(job: JobSpec, options: RequestOptions = {}): Promise<Job> {
-    return new Job(this, await this.call("POST", "/v1/jobs", job, options));
+    return new Job(this, await controlRequest(this.settings, "POST", "/v1/jobs", job, options, { submission: true }));
   }
 
   /** A job by id. */
@@ -118,8 +99,6 @@ export class Client {
     return new Job(this, await this.call("GET", `/v1/jobs/${encodeURIComponent(id)}`, undefined, options));
   }
 }
-
-const RATE_RETRIES = 5;
 
 /** Start a call with the run's deadline, then wait for it with what is left. */
 async function runWith(options: WaitOptions, what: string, start: (signal?: AbortSignal) => Promise<Call>): Promise<any> {

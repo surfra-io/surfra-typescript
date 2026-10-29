@@ -18,7 +18,7 @@ async function serve(t, handler) {
     let raw = "";
     req.on("data", (chunk) => (raw += chunk));
     req.on("end", () => {
-      const item = { method: req.method, path: req.url, auth: req.headers.authorization, body: raw ? JSON.parse(raw) : undefined };
+      const item = { method: req.method, path: req.url, auth: req.headers.authorization, client: req.headers["surfra-client"], body: raw ? JSON.parse(raw) : undefined };
       seen.push(item);
       handler(item, res);
     });
@@ -188,4 +188,14 @@ test("sleep rejects with the signal's reason", async () => {
   const { error, ms } = await elapsed(() => sleep(10_000, controller.signal));
   assert.equal(error?.name, "AbortError");
   assert.ok(ms < 1000);
+});
+
+test("every request names this package and its version, and the version matches package.json", async (t) => {
+  const pkg = JSON.parse(await fs.readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const { VERSION } = await import("../dist/core.js");
+  assert.equal(VERSION, pkg.version);
+  const fake = await serve(t, running);
+  await new Client(fake.settings).enqueue("embed", {});
+  const seen = fake.seen;
+  assert.equal(seen[0].client, `surfra-typescript/${pkg.version}`);
 });

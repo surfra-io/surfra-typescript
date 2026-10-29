@@ -1,6 +1,6 @@
 // Volumes over HTTP, for every runtime. The Node build adds local sync on top (see node.ts).
 
-import { checked, controlCredential, credential, encodePath, guarded, REQUEST_TIMEOUT_MS, settingsFromEnv, signalFor, SurfraError, type RequestOptions, type Settings } from "./core.js";
+import { checked, controlRequest, credential, encodePath, guarded, REQUEST_TIMEOUT_MS, sendWithRetry, settingsFromEnv, signalFor, SurfraError, type RequestOptions, type Settings } from "./core.js";
 
 export type Mode = "r" | "w" | "rw";
 
@@ -55,7 +55,9 @@ export class Volume {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(init.json);
     }
-    return fetch(url, { method, headers, body, signal: init.signal });
+    // Overload answers and connections that never got through are retried (see core.ts). A 404 comes back
+    // to the caller, which may create the volume and try again.
+    return sendWithRetry({ method, url, headers, body }, { settings: this.settings, signal: init.signal, accept: (response) => response.status === 404 });
   }
 
   /** A request to the volumes service. Writes to a volume that does not exist yet create it first. */
@@ -73,13 +75,7 @@ export class Volume {
   }
 
   protected async control(method: string, route: string, json?: unknown, options: RequestOptions = {}): Promise<any> {
-    const signal = signalFor(options, this.settings.requestTimeoutMs ?? REQUEST_TIMEOUT_MS);
-    return guarded(signal, async () => {
-      const headers: Record<string, string> = { Authorization: `Bearer ${controlCredential(this.settings)}` };
-      if (json !== undefined) headers["Content-Type"] = "application/json";
-      const response = await fetch(`${this.settings.master}${route}`, { method, headers, body: json === undefined ? undefined : JSON.stringify(json), signal });
-      return (await checked(response)).json();
-    });
+    return controlRequest(this.settings, method, route, json, options);
   }
 
   /** Create the volume. Writing to a volume that does not exist yet does this for you. */
