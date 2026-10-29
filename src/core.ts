@@ -2,7 +2,7 @@
 // Cloudflare Workers and browsers: nothing here touches the file system.
 
 /** This package's version. Sent as Surfra-Client so the control plane can trace errors to a release; a test keeps it equal to package.json. */
-export const VERSION = "0.2.1";
+export const VERSION = "0.3.0";
 export const DEFAULT_MASTER = "https://api.surfra.io";
 export const DEFAULT_VOLUMES = "https://volumes.surfra.io";
 export const PART_BYTES = 64 * 1024 * 1024;
